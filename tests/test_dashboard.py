@@ -7,6 +7,8 @@ import base64
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -98,6 +100,85 @@ def test_no_page_word_in_buttons():
     assert all("Page" not in child.children for child in buttons)
 
 
+def test_member_attendance_is_not_inflated_by_team_presence():
+    df = pd.DataFrame(
+        {
+            "year": [2024],
+            "cohort": ["English"],
+            "Sector": ["Services & Consulting"],
+            "sessions_scheduled": [5],
+            "attendance_member_rows": [2],
+            "member_days_present": [5],
+            "member_days_virtual": [0],
+            "team_days_present": [5],
+            "team_days_virtual": [0],
+            "team_attendance_rate": [1.0],
+            "member_attendance_rate": [0.5],
+        }
+    )
+    summary = dashboard._attendance_summary(df, "Sector")
+    assert summary is not None and not summary.empty
+    assert summary["attendance_projects"].iloc[0] == 1
+    assert summary["sessions_scheduled"].iloc[0] == 5
+    assert summary["member_attendance_rate"].iloc[0] == 50.0
+
+    fig = dashboard._attendance_bar_fig(summary, "Sector")
+    assert list(fig.data[0].x) == ["Services & Consulting"]
+    assert list(fig.data[0].y) == [50.0]
+    assert list(fig.data[0].text) == ["50.0%"]
+
+
+def test_team_size_chart_uses_5_plus_and_blanks():
+    df = pd.DataFrame(
+        {
+            "team_member_count": [1.0, 2.0, 3.0, 5.0, 6.0, "5+", None],
+            "team_size_from_attendance": [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0],
+        }
+    )
+    fig = dashboard._team_size_fig(df)
+    assert list(fig.data[0].x) == ["1", "2", "3", "4", "5", "5+", "Blanks"]
+    assert list(fig.data[0].y) == [1, 1, 1, 0, 1, 2, 1]
+    assert list(fig.data[0].text) == ["1", "1", "1", "0", "1", "2", "1"]
+    assert fig.layout.xaxis.type == "category"
+    assert list(fig.layout.xaxis.categoryarray) == [
+        "Blanks",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "5+",
+    ]
+    assert fig.layout.xaxis.autorange != "reversed"
+
+
+def test_overview_and_sector_pages_use_uniform_grid():
+    dashboard.handle_upload(_upload_contents(DUMMY_CSV), DUMMY_CSV.name)
+    for page in ("page1", "page3"):
+        rendered = dashboard.update_page(page, None, None, None, None, None, None)
+        rows = rendered[2].children
+        assert rows
+        cards = []
+
+        def collect_cards(node):
+            if getattr(node, "className", None) == "chart-card":
+                cards.append(node.style)
+            children = getattr(node, "children", None)
+            if children is None:
+                return
+            if not isinstance(children, (list, tuple)):
+                children = [children]
+            for child in children:
+                collect_cards(child)
+
+        for row in rows:
+            assert "chart-grid" in row.className
+            assert row.style.get("display") == "grid"
+            collect_cards(row)
+        assert cards
+        assert all(card_style.get("flex") == "1" for card_style in cards)
+
+
 def main():
     tests = [
         test_index_page_serves,
@@ -106,6 +187,9 @@ def main():
         test_filters_produce_content,
         test_empty_data_uploads_render_a_prompt,
         test_switch_page,
+        test_member_attendance_is_not_inflated_by_team_presence,
+        test_team_size_chart_uses_5_plus_and_blanks,
+        test_overview_and_sector_pages_use_uniform_grid,
     ]
     for test in tests:
         test()

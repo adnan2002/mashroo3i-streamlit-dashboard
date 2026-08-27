@@ -82,8 +82,19 @@ ATTENDANCE_COLUMNS = [
     "team_days_virtual",
     "team_attendance_rate",
     "member_attendance_rate",
+    "attendance_member_rows",
+    "member_days_present",
+    "member_days_virtual",
+    "team_size_from_attendance",
 ]
 REQUIRED_COLUMNS.extend(ATTENDANCE_COLUMNS)
+
+MEMBER_ATTENDANCE_COLUMNS = {
+    "sessions_scheduled",
+    "attendance_member_rows",
+    "member_days_present",
+    "member_days_virtual",
+}
 
 btn_w = {
     "background": "white",
@@ -142,6 +153,63 @@ def _attendance_pct(series):
     if values.notna().any() and values.max() <= 1.0:
         values = values * 100
     return values
+
+
+def _attendance_summary(df, by):
+    """Summarize individual member attendance for one grouping column.
+
+    ``team_attendance_rate`` only measures whether at least one member
+    attended a session, so a team with six members and only one attendee can
+    appear to have 100% attendance. This helper instead measures the total
+    member-days attended against the total member-session opportunities:
+
+    (member_days_present + member_days_virtual)
+    / (sessions_scheduled * attendance_member_rows)
+    """
+    if not MEMBER_ATTENDANCE_COLUMNS.issubset(df.columns) or by not in df.columns:
+        return None
+
+    attendance = df.copy()
+    attendance["_sessions"] = pd.to_numeric(
+        attendance["sessions_scheduled"], errors="coerce"
+    ).fillna(0)
+    attendance["_members"] = pd.to_numeric(
+        attendance["attendance_member_rows"], errors="coerce"
+    ).fillna(0)
+    attendance["_present"] = pd.to_numeric(
+        attendance["member_days_present"], errors="coerce"
+    ).fillna(0)
+    attendance["_virtual"] = pd.to_numeric(
+        attendance["member_days_virtual"], errors="coerce"
+    ).fillna(0)
+
+    attendance["_member_opportunities"] = (
+        attendance["_sessions"] * attendance["_members"]
+    )
+    attendance["_member_days_attended"] = (
+        attendance["_present"] + attendance["_virtual"]
+    )
+    attendance["_has_attendance"] = (
+        attendance["_member_opportunities"] > 0
+    )
+    attended = attendance[attendance["_has_attendance"]].copy()
+    if attended.empty:
+        return attended
+
+    summary = (
+        attended.groupby(by, dropna=False)
+        .agg(
+            attendance_projects=("_has_attendance", "sum"),
+            sessions_scheduled=("_sessions", "sum"),
+            member_opportunities=("_member_opportunities", "sum"),
+            member_days_attended=("_member_days_attended", "sum"),
+        )
+        .reset_index()
+    )
+    summary["member_attendance_rate"] = (
+        summary["member_days_attended"] / summary["member_opportunities"] * 100
+    )
+    return summary
 
 
 def _age_order(index):
@@ -419,6 +487,88 @@ def _bar_fig(x, y, orientation="v", text=None, color=C_ORANGE, radius=14):
     return fig
 
 
+def _attendance_bar_fig(summary, by, horizontal=False, max_items=None):
+    """Build a member-attendance bar chart with the group on the x-axis."""
+    if summary is None or summary.empty:
+        return _bar_fig([], [], orientation="h" if horizontal else "v")
+
+    indexed = summary.set_index(by)
+    values = indexed["member_attendance_rate"].round(1)
+    if max_items:
+        values = values.sort_values().tail(max_items)
+    elif horizontal:
+        values = values.sort_values()
+    else:
+        values = values.sort_values(ascending=False)
+
+    labels = [f"{value}%" for value in values.values]
+    if horizontal:
+        return _bar_fig(
+            values.values,
+            values.index,
+            orientation="h",
+            text=labels,
+        )
+    fig = _bar_fig(
+        values.index,
+        values.values,
+        orientation="v",
+        text=labels,
+    )
+    fig.update_xaxes(type="category")
+    return fig
+
+
+def _team_size_bucket(value):
+    """Map a raw team-member count to a display category."""
+    if pd.isna(value):
+        return "Blanks"
+    text = str(value).strip()
+    if text in {"", "-", "nan", "None", "null"}:
+        return "Blanks"
+    if text == "5+":
+        return "5+"
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return "Blanks"
+    if pd.isna(number) or number <= 0:
+        return "Blanks"
+    if number > 5:
+        return "5+"
+    return str(int(number))
+
+
+def _team_size_fig(df):
+    """Build a team-size distribution with 1-5, 5+, and Blanks buckets."""
+    if "team_member_count" in df.columns:
+        size_col = "team_member_count"
+    elif "team_size_from_attendance" in df.columns:
+        size_col = "team_size_from_attendance"
+    elif "attendance_member_rows" in df.columns:
+        size_col = "attendance_member_rows"
+    else:
+        return _bar_fig([], [])
+
+    buckets = {"1": 0, "2": 0, "3": 0, "4": 0, "5": 0, "5+": 0, "Blanks": 0}
+    for value in df[size_col]:
+        buckets[_team_size_bucket(value)] += 1
+
+    labels = list(buckets)
+    counts = pd.Series(buckets).reindex(labels).astype(int)
+    fig = _bar_fig(
+        labels,
+        counts.values,
+        text=[str(int(value)) for value in counts.values],
+    )
+    fig.update_xaxes(
+        type="category",
+        categoryorder="array",
+        categoryarray=["Blanks", "1", "2", "3", "4", "5", "5+"],
+    )
+    return fig
+
+
 def _card(title, fig, flex="1"):
     """Modern card with a consistent chart height, so nothing gets clipped."""
     return html.Div(
@@ -464,7 +614,16 @@ def _row(*cards):
     )
 
 
-def _page_shell(title, kpis, *rows):
+def _grid_row(*cards):
+    """One chart row with equal-width cards in a CSS grid."""
+    return html.Div(
+        className=f"chart-row chart-grid chart-cols-{len(cards)}",
+        style={"display": "grid", "gap": "16px", "minWidth": "0"},
+        children=list(cards),
+    )
+
+
+def _page_shell(title, kpis, *rows, subtitle="Live insights from the uploaded dataset"):
     return [
         html.Div(
             className="page-heading",
@@ -472,7 +631,7 @@ def _page_shell(title, kpis, *rows):
             children=[
                 html.Div(title, className="page-title"),
                 html.Div(
-                    "Live insights from the uploaded dataset",
+                    subtitle,
                     className="page-subtitle",
                 ),
             ],
@@ -670,17 +829,21 @@ def update_page(
         fig_nat = _bar_fig(
             cnt_nat.values, cnt_nat.index, orientation="h", text=cnt_nat.values
         )
+        fig_team_size = _team_size_fig(dff)
 
         return _page_shell(
             "Overview",
             kpis,
-            _row(
-                _card("Applications by Year & Cohort", fig_y, flex="2"),
+            _grid_row(
+                _card("Applications by Year & Cohort", fig_y),
                 _card("Accepted Applications Over Years", fig_acc),
             ),
-            _row(
+            _grid_row(
                 _card("Applicant Type Breakdown", fig_type),
                 _card("Top Nationalities", fig_nat),
+            ),
+            _grid_row(
+                _card("Team Member Size", fig_team_size),
             ),
         )
 
@@ -793,11 +956,11 @@ def update_page(
         return _page_shell(
             "Sectors & Applicant Type",
             kpis,
-            _row(
-                _card("Applicant Type vs Outcome", fig_type_out, flex="2"),
+            _grid_row(
+                _card("Applicant Type vs Outcome", fig_type_out),
                 _card("Top Sectors", fig_sec),
             ),
-            _row(
+            _grid_row(
                 _card("Applicant Type Over Years", fig_y_type),
                 _card("Acceptance Rate by Sector", fig_sec_rate),
             ),
@@ -912,87 +1075,114 @@ def update_page(
                 )
             ]
 
-        if "team_attendance_rate" in dff.columns:
-            att_series = _attendance_pct(dff["team_attendance_rate"])
-            att_by_cohort = att_series.groupby(dff["cohort"]).mean().round(1).sort_values(ascending=False)
-            fig_att_cohort = _bar_fig(
-                att_by_cohort.index,
-                att_by_cohort.values,
-                text=att_by_cohort.values.astype(str) + "%",
-            )
-            att_by_year = att_series.groupby(dff["year"]).mean().round(1).sort_index()
-            fig_att_year = _bar_fig(
-                att_by_year.index,
-                att_by_year.values,
-                text=att_by_year.values.astype(str) + "%",
-            )
-            fig_att_year.update_layout(
-                xaxis=dict(title="", showgrid=False, tickfont=dict(family=CHART_FONT, size=11, color=C_TEXT), tickformat="d")
-            )
-            att_by_sector = att_series.groupby(dff["Sector"]).mean().round(1).sort_values().tail(6)
-            fig_att_sector = _bar_fig(
-                att_by_sector.values,
-                att_by_sector.index,
-                orientation="h",
-                text=att_by_sector.values.astype(str) + "%",
+        if "member_attendance_rate" in dff.columns:
+            attendance_projects = int(
+                dff["member_attendance_rate"].notna().sum()
             )
         else:
-            fig_att_cohort = _bar_fig([], [])
-            fig_att_year = _bar_fig([], [])
-            fig_att_sector = _bar_fig([], [])
+            attendance_projects = 0
+        attendance_note = (
+            f"Member attendance is shown for {attendance_projects} "
+            f"attendance-matched projects out of {len(dff)} applicant rows "
+            "in the current filter."
+        )
 
-        if {"sessions_scheduled", "team_days_present"}.issubset(dff.columns):
-            sessions = (
-                dff.groupby("year")[["sessions_scheduled", "team_days_present"]]
-                .sum()
-                .reset_index()
-                .melt(id_vars="year", var_name="metric", value_name="Total")
+        yearly_attendance = _attendance_summary(dff, "year")
+        if yearly_attendance is not None and not yearly_attendance.empty:
+            cohort_attendance = _attendance_summary(dff, "cohort")
+            sector_attendance = _attendance_summary(dff, "Sector")
+            attendance_projects = int(
+                yearly_attendance["attendance_projects"].sum()
             )
-            sessions["metric"] = sessions["metric"].map(
-                {
-                    "sessions_scheduled": "Scheduled Sessions",
-                    "team_days_present": "Days Present",
-                }
+            overall_rate = (
+                yearly_attendance["member_days_attended"].sum()
+                / yearly_attendance["member_opportunities"].sum()
+                * 100
             )
-            fig_sessions = px.bar(
-                sessions,
-                x="year",
-                y="Total",
-                color="metric",
-                barmode="group",
-                color_discrete_map={
-                    "Scheduled Sessions": C_ORANGE,
-                    "Days Present": C_ORANGE_SOFT,
-                },
-                text="Total",
+            attendance_note = (
+                f"Member attendance is shown for {attendance_projects} "
+                f"attendance-matched projects out of {len(dff)} applicant rows "
+                f"in the current filter. Overall: {overall_rate:.1f}%."
             )
-            fig_sessions.update_traces(marker=dict(cornerradius=10), textposition="outside", cliponaxis=False)
-            fig_sessions.update_layout(
-                margin=dict(l=10, r=50, t=45, b=10),
-                legend_title_text="Metric",
-                bargap=0.4,
-                bargroupgap=0.25,
-                legend=dict(orientation="h", y=1.35, x=0.5, xanchor="center", font=dict(family=CHART_FONT, size=9)),
-                xaxis=dict(title="", showgrid=False, tickfont=dict(family=CHART_FONT, size=11, color=C_TEXT), tickformat="d"),
-                yaxis=dict(title="", visible=False),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(family=CHART_FONT, size=11, color=C_TEXT),
+            fig_att_cohort = _attendance_bar_fig(cohort_attendance, "cohort")
+            fig_att_year = _attendance_bar_fig(yearly_attendance, "year")
+            fig_att_year.update_layout(
+                xaxis=dict(
+                    title="",
+                    showgrid=False,
+                    tickfont=dict(family=CHART_FONT, size=11, color=C_TEXT),
+                    tickformat="d",
+                )
+            )
+            fig_att_sector = _attendance_bar_fig(
+                sector_attendance, "Sector", horizontal=True, max_items=6
             )
         else:
-            fig_sessions = _bar_fig([], [])
+            rate_col = (
+                "member_attendance_rate"
+                if "member_attendance_rate" in dff.columns
+                else "team_attendance_rate"
+                if "team_attendance_rate" in dff.columns
+                else None
+            )
+            if rate_col:
+                att_series = _attendance_pct(dff[rate_col])
+                att_by_cohort = (
+                    att_series.groupby(dff["cohort"])
+                    .mean()
+                    .round(1)
+                    .sort_values(ascending=False)
+                )
+                fig_att_cohort = _bar_fig(
+                    att_by_cohort.index,
+                    att_by_cohort.values,
+                    text=att_by_cohort.values.astype(str) + "%",
+                )
+                att_by_year = (
+                    att_series.groupby(dff["year"]).mean().round(1).sort_index()
+                )
+                fig_att_year = _bar_fig(
+                    att_by_year.index,
+                    att_by_year.values,
+                    text=att_by_year.values.astype(str) + "%",
+                )
+                fig_att_year.update_layout(
+                    xaxis=dict(
+                        title="",
+                        showgrid=False,
+                        tickfont=dict(family=CHART_FONT, size=11, color=C_TEXT),
+                        tickformat="d",
+                    )
+                )
+                att_by_sector = (
+                    att_series.groupby(dff["Sector"])
+                    .mean()
+                    .round(1)
+                    .sort_values()
+                    .tail(6)
+                )
+                fig_att_sector = _bar_fig(
+                    att_by_sector.values,
+                    att_by_sector.index,
+                    orientation="h",
+                    text=att_by_sector.values.astype(str) + "%",
+                )
+            else:
+                fig_att_cohort = _bar_fig([], [])
+                fig_att_year = _bar_fig([], [])
+                fig_att_sector = _bar_fig([], [])
 
         return _page_shell(
             "Attendance",
             kpis,
             _row(
-                _card("Attendance Rate by Cohort", fig_att_cohort),
-                _card("Attendance Rate by Year", fig_att_year),
+                _card("Member Attendance Rate by Cohort", fig_att_cohort),
+                _card("Member Attendance Rate by Year", fig_att_year),
             ),
-            _row(
-                _card("Sessions Scheduled vs Days Present", fig_sessions),
-                _card("Attendance by Sector", fig_att_sector),
+            _grid_row(
+                _card("Member Attendance by Sector", fig_att_sector),
             ),
+            subtitle=attendance_note,
         )
 
 

@@ -178,6 +178,16 @@ def _inject_theme() -> None:
         .stApp {
           background: var(--ms-bg);
         }
+        .stApp [data-testid="stMain"] {
+          padding-top: 0 !important;
+        }
+        .stApp [data-testid="stMainBlockContainer"] {
+          padding-top: 0 !important;
+          margin-top: 0 !important;
+        }
+        .stApp [data-testid="stAppViewContainer"] {
+          padding-top: 0 !important;
+        }
         [data-testid="stHeader"] {
           background: transparent;
         }
