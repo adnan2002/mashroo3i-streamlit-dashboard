@@ -64,7 +64,10 @@ gunicorn --bind 0.0.0.0:8050 app:server
 1. Push this repository to GitHub.
 2. Open <https://share.streamlit.io> and sign in with GitHub.
 3. Choose **New app** and select this repository.
-4. Set the main file path to `streamlit_app.py`.
+   Use `adnan2002/mashroo3i-streamlit-dashboard`, branch `main`.
+   The older public `mashroo3i-dashboard` repository is a different app
+   and will fail with a missing local CSV file.
+4. Set main file path to `streamlit_app.py`, **not** `app.py`.
 5. Streamlit will install `requirements.txt` and start the app automatically.
 
 The Streamlit build uses the same charts, filters, and warm orange/peach theme
